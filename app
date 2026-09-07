@@ -14,6 +14,8 @@ import pystray
 from pystray import MenuItem as item
 import csv
 from io import StringIO
+import queue
+import winreg
 
 # ============================================================
 # КОНФИГУРАЦИЯ
@@ -50,6 +52,309 @@ PING_TIMEOUT = 2.0  # таймаут одного подключения
 # Глобальная переменная для хранения хэндла мьютекса
 mutex_handle = None
 mutex_released = False
+
+# Очередь для безопасной связи между tray thread и GUI thread
+tray_command_queue = queue.Queue()
+
+# ============================================================
+# МЕНЕДЖЕР СЕРВИСОВ (перенос логики service.bat в Python)
+# ============================================================
+
+SERVICE_NAME = "zapret"
+SERVICE_DISPLAY_NAME = "zapret"
+SERVICE_DESCRIPTION = "Zapret DPI bypass software"
+
+
+class ServiceManager:
+    """Управление сервисом Windows для zapret."""
+    
+    @staticmethod
+    def is_admin():
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    
+    @staticmethod
+    def run_as_admin(script_path=None):
+        """Запускает текущий скрипт от администратора."""
+        try:
+            if getattr(sys, "frozen", False):
+                executable = sys.executable
+                params = " ".join(f'"{arg}"' for arg in sys.argv[1:])
+            else:
+                executable = sys.executable
+                params = " ".join([f'"{sys.argv[0]}"'] + [f'"{arg}"' for arg in sys.argv[1:]])
+            
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
+            return True
+        except Exception:
+            return False
+    
+    @staticmethod
+    def check_service_exists(service_name=SERVICE_NAME):
+        """Проверяет, существует ли сервис."""
+        try:
+            result = subprocess.run(
+                ["sc", "query", service_name],
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            # ERROR_SERVICE_DOES_NOT_EXIST = 1060
+            if result.returncode == 1060:
+                return False
+            return True
+        except Exception:
+            return False
+    
+    @staticmethod
+    def get_service_status(service_name=SERVICE_NAME):
+        """
+        Возвращает статус сервиса.
+        Возвращает: None (не существует), "RUNNING", "STOPPED", "STOP_PENDING", "START_PENDING", или другое
+        """
+        try:
+            result = subprocess.run(
+                ["sc", "query", service_name],
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                return None
+            
+            for line in result.stdout.splitlines():
+                if "STATE" in line.upper():
+                    # Пример: "        STATE              : 4  RUNNING"
+                    parts = line.split(":")
+                    if len(parts) >= 2:
+                        status = parts[1].strip().split()[0]
+                        return status
+            return "UNKNOWN"
+        except Exception:
+            return None
+    
+    @staticmethod
+    def get_service_strategy(service_name=SERVICE_NAME):
+        """Получает стратегию из реестра."""
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                f"System\\CurrentControlSet\\Services\\{service_name}",
+                0,
+                winreg.KEY_READ
+            )
+            try:
+                strategy, _ = winreg.QueryValueEx(key, "zapret-discord-youtube")
+                winreg.CloseKey(key)
+                return strategy
+            except FileNotFoundError:
+                winreg.CloseKey(key)
+                return None
+        except Exception:
+            return None
+    
+    @staticmethod
+    def set_service_strategy(strategy, service_name=SERVICE_NAME):
+        """Устанавливает стратегию в реестр."""
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                f"System\\CurrentControlSet\\Services\\{service_name}",
+                0,
+                winreg.KEY_WRITE
+            )
+            try:
+                winreg.SetValueEx(key, "zapret-discord-youtube", 0, winreg.REG_SZ, strategy)
+                winreg.CloseKey(key)
+                return True
+            except Exception:
+                winreg.CloseKey(key)
+                return False
+        except Exception:
+            return False
+    
+    @staticmethod
+    def install_service(bin_path, args, service_name=SERVICE_NAME):
+        """
+        Устанавливает сервис.
+        bin_path: путь к winws.exe
+        args: аргументы командной строки
+        Возвращает: (success, message)
+        """
+        try:
+            # Удаляем старый сервис если существует
+            ServiceManager.delete_service(service_name)
+            
+            # Создаём сервис
+            binpath = f'"{bin_path}" {args}'
+            result = subprocess.run(
+                ["sc", "create", service_name, "binPath=", binpath, "DisplayName=", SERVICE_DISPLAY_NAME, "start=", "auto"],
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode != 0:
+                return False, f"Ошибка создания сервиса: {result.stderr}"
+            
+            # Устанавливаем описание
+            subprocess.run(
+                ["sc", "description", service_name, SERVICE_DESCRIPTION],
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            # Проверяем что сервис создан
+            if not ServiceManager.check_service_exists(service_name):
+                return False, "Сервис не появился после создания"
+            
+            return True, "Сервис успешно установлен"
+        except Exception as e:
+            return False, f"Ошибка: {str(e)}"
+    
+    @staticmethod
+    def delete_service(service_name=SERVICE_NAME):
+        """
+        Удаляет сервис.
+        Возвращает: (success, message)
+        """
+        try:
+            # Сначала останавливаем
+            ServiceManager.stop_service(service_name)
+            time.sleep(0.5)
+            
+            result = subprocess.run(
+                ["sc", "delete", service_name],
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            # Проверяем результат
+            time.sleep(0.5)
+            if ServiceManager.check_service_exists(service_name):
+                return False, "Не удалось удалить сервис"
+            
+            return True, "Сервис успешно удалён"
+        except Exception as e:
+            return False, f"Ошибка: {str(e)}"
+    
+    @staticmethod
+    def start_service(service_name=SERVICE_NAME):
+        """
+        Запускает сервис.
+        Возвращает: (success, message)
+        """
+        try:
+            result = subprocess.run(
+                ["sc", "start", service_name],
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode != 0:
+                # Проверяем, может уже запущен
+                status = ServiceManager.get_service_status(service_name)
+                if status == "RUNNING":
+                    return True, "Сервис уже запущен"
+                return False, f"Ошибка запуска: {result.stderr}"
+            
+            # Ждём запуска
+            for _ in range(20):
+                time.sleep(0.25)
+                status = ServiceManager.get_service_status(service_name)
+                if status == "RUNNING":
+                    return True, "Сервис успешно запущен"
+                if status not in ("START_PENDING", None):
+                    break
+            
+            return False, "Сервис не перешёл в состояние RUNNING"
+        except Exception as e:
+            return False, f"Ошибка: {str(e)}"
+    
+    @staticmethod
+    def stop_service(service_name=SERVICE_NAME):
+        """
+        Останавливает сервис.
+        Возвращает: (success, message)
+        """
+        try:
+            status = ServiceManager.get_service_status(service_name)
+            if status == "STOPPED":
+                return True, "Сервис уже остановлен"
+            if status is None:
+                return False, "Сервис не существует"
+            
+            result = subprocess.run(
+                ["sc", "stop", service_name],
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode != 0:
+                return False, f"Ошибка остановки: {result.stderr}"
+            
+            # Ждём остановки
+            for _ in range(20):
+                time.sleep(0.25)
+                status = ServiceManager.get_service_status(service_name)
+                if status == "STOPPED":
+                    return True, "Сервис успешно остановлен"
+                if status not in ("STOP_PENDING", "RUNNING", None):
+                    break
+            
+            return False, "Сервис не перешёл в состояние STOPPED"
+        except Exception as e:
+            return False, f"Ошибка: {str(e)}"
+    
+    @staticmethod
+    def restart_service(service_name=SERVICE_NAME):
+        """Перезапускает сервис."""
+        success, msg = ServiceManager.stop_service(service_name)
+        if not success:
+            return False, msg
+        time.sleep(1)
+        return ServiceManager.start_service(service_name)
+    
+    @staticmethod
+    def is_winws_running():
+        """Проверяет, запущен ли winws.exe."""
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq winws.exe"],
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True
+            )
+            return "winws.exe" in result.stdout.lower()
+        except Exception:
+            return False
+    
+    @staticmethod
+    def kill_winws():
+        """Убивает все процессы winws.exe."""
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "winws.exe"],
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True
+            )
+            return True
+        except Exception:
+            return False
 
 # ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -486,17 +791,17 @@ class ZapretLauncher(ctk.CTk):
         )
         self.scroll_frame.pack(fill="both", expand=True)
 
-        # КНОПКА SERVICE.BAT (под колонками, на всю ширину)
+        # КНОПКА УПРАВЛЕНИЕ СЕРВИСОМ (под колонками, на всю ширину)
         self.btn_service = ctk.CTkButton(
             self.main_card,
-            text="⚙ Настройки (service.bat)",
+            text="⚙ Управление сервисом",
             font=ctk.CTkFont(size=13, weight="bold"),
             fg_color="#3B82F6",
             hover_color="#2563EB",
             text_color="#FFFFFF",
             height=36,
             corner_radius=6,
-            command=self.run_service_bat
+            command=self.open_service_manager
         )
         self.btn_service.pack(fill="x", padx=14, pady=(8, 8))
 
@@ -1198,31 +1503,26 @@ class ZapretLauncher(ctk.CTk):
         return version_path, service_path
 
     # ========================================================
-    # SERVICE.BAT
+    # УПРАВЛЕНИЕ СЕРВИСОМ (окно)
     # ========================================================
 
-    def run_service_bat(self):
+    def open_service_manager(self):
+        """Открывает окно управления сервисом."""
         if self.testing_all:
             return
-        version_path, service_path = self.get_current_paths()
-        if not version_path:
-            messagebox.showwarning("Внимание", "Сначала выберите версию Zapret.")
-            return
-        if not service_path:
-            messagebox.showerror("Ошибка", "Файл service.bat не найден в выбранной версии.")
-            return
-
-        try:
-            ctypes.windll.shell32.ShellExecuteW(
-                None,
-                "runas",
-                "cmd.exe",
-                f'/c call "{service_path}"',
-                version_path,
-                1  # SW_SHOWNORMAL
+        
+        # Проверяем права администратора
+        if not ServiceManager.is_admin():
+            messagebox.showerror(
+                "Ошибка",
+                "Для управления сервисом требуются права администратора.\n\n"
+                "Перезапустите приложение от имени администратора."
             )
-        except Exception as error:
-            messagebox.showerror("Ошибка запуска", f"Не удалось запустить service.bat:\n\n{error}")
+            return
+        
+        service_window = ServiceManagerWindow(self)
+        service_window.grab_set()
+
 
     # ========================================================
     # ЗАПУСК ZAPRET (ОБЫЧНЫЙ)
@@ -1512,7 +1812,7 @@ class ZapretLauncher(ctk.CTk):
             item("Стоп", lambda icon, menu_item: self.after(0, self.stop_process)),
             item("Сменить версию", version_menu),
             pystray.Menu.SEPARATOR,
-            item("Настройки (service.bat)", lambda icon, menu_item: self.after(0, self.run_service_bat)),
+            item("Управление сервисом", lambda icon, menu_item: self.after(0, self.open_service_manager)),
             pystray.Menu.SEPARATOR,
             item("Выход", lambda icon, menu_item: self.after(0, self.quit_app))
         )
@@ -1580,6 +1880,409 @@ class ZapretLauncher(ctk.CTk):
 
         release_mutex()
         sys.exit()
+
+
+# ============================================================
+# ОКНО УПРАВЛЕНИЯ СЕРВИСОМ
+# ============================================================
+
+class ServiceManagerWindow(ctk.CTkToplevel):
+    """Окно управления сервисом Zapret."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        
+        self.title("Управление сервисом Zapret")
+        self.geometry("500x480")
+        self.resizable(False, False)
+        self.configure(fg_color="#121318")
+        
+        self.parent = parent
+        self.service_exists = False
+        self.service_running = False
+        self.current_strategy = None
+        
+        self.create_interface()
+        self.refresh_status()
+        
+        # Периодическое обновление статуса
+        self.update_status_periodically()
+
+    def create_interface(self):
+        """Создаёт интерфейс окна."""
+        # Заголовок
+        header = ctk.CTkLabel(
+            self,
+            text="Управление сервисом Windows",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color="#FFFFFF"
+        )
+        header.pack(pady=(16, 8))
+
+        # Карточка статуса
+        status_card = ctk.CTkFrame(
+            self,
+            fg_color="#1E2029",
+            border_color="#2E3240",
+            border_width=1,
+            corner_radius=10
+        )
+        status_card.pack(fill="x", padx=16, pady=8)
+
+        self.status_label = ctk.CTkLabel(
+            status_card,
+            text="Статус: Проверка...",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#F59E0B"
+        )
+        self.status_label.pack(pady=10)
+
+        self.strategy_label = ctk.CTkLabel(
+            status_card,
+            text="Стратегия: --",
+            font=ctk.CTkFont(size=12),
+            text_color="#9CA3AF"
+        )
+        self.strategy_label.pack(pady=(0, 10))
+
+        # Кнопки управления
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=16, pady=8)
+
+        self.btn_install = ctk.CTkButton(
+            btn_frame,
+            text="📥 Установить сервис",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#3B82F6",
+            hover_color="#2563EB",
+            height=36,
+            command=self.install_service
+        )
+        self.btn_install.pack(side="left", fill="both", expand=True, padx=(0, 4))
+
+        self.btn_delete = ctk.CTkButton(
+            btn_frame,
+            text="🗑 Удалить сервис",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#EF4444",
+            hover_color="#DC2626",
+            height=36,
+            command=self.delete_service
+        )
+        self.btn_delete.pack(side="right", fill="both", expand=True, padx=(4, 0))
+
+        # Кнопки запуска/остановки
+        run_frame = ctk.CTkFrame(self, fg_color="transparent")
+        run_frame.pack(fill="x", padx=16, pady=8)
+
+        self.btn_start = ctk.CTkButton(
+            run_frame,
+            text="▶ Запустить",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#10B981",
+            hover_color="#059669",
+            height=36,
+            command=self.start_service
+        )
+        self.btn_start.pack(side="left", fill="both", expand=True, padx=(0, 4))
+
+        self.btn_stop = ctk.CTkButton(
+            run_frame,
+            text="⏹ Остановить",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#F59E0B",
+            hover_color="#D97706",
+            height=36,
+            command=self.stop_service
+        )
+        self.btn_stop.pack(side="right", fill="both", expand=True, padx=(4, 0))
+
+        # Кнопка перезапуска
+        self.btn_restart = ctk.CTkButton(
+            self,
+            text="🔄 Перезапустить",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#8B5CF6",
+            hover_color="#7C3AED",
+            height=36,
+            command=self.restart_service
+        )
+        self.btn_restart.pack(fill="x", padx=16, pady=8)
+
+        # Разделитель
+        separator = ctk.CTkFrame(self, fg_color="#2E3240", height=2)
+        separator.pack(fill="x", padx=16, pady=12)
+
+        # Информация о winws.exe
+        info_label = ctk.CTkLabel(
+            self,
+            text="Информация о процессе:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#FFFFFF"
+        )
+        info_label.pack(anchor="w", padx=16)
+
+        self.winws_status_label = ctk.CTkLabel(
+            self,
+            text="winws.exe: Проверка...",
+            font=ctk.CTkFont(size=11),
+            text_color="#9CA3AF"
+        )
+        self.winws_status_label.pack(anchor="w", padx=16, pady=(4, 8))
+
+        # Кнопка закрытия
+        close_btn = ctk.CTkButton(
+            self,
+            text="Закрыть",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#1E2029",
+            border_color="#2E3240",
+            border_width=1,
+            hover_color="#2E3240",
+            height=36,
+            command=self.destroy
+        )
+        close_btn.pack(fill="x", padx=16, pady=(0, 16))
+
+    def refresh_status(self):
+        """Обновляет статус сервиса."""
+        try:
+            self.service_exists = ServiceManager.check_service_exists()
+            
+            if self.service_exists:
+                status = ServiceManager.get_service_status()
+                self.current_strategy = ServiceManager.get_service_strategy()
+                
+                if status == "RUNNING":
+                    self.service_running = True
+                    self.status_label.configure(
+                        text="● Сервис ЗАПУЩЕН",
+                        text_color="#10B981"
+                    )
+                elif status == "STOPPED":
+                    self.service_running = False
+                    self.status_label.configure(
+                        text="● Сервис ОСТАНОВЛЕН",
+                        text_color="#F59E0B"
+                    )
+                elif status == "STOP_PENDING":
+                    self.status_label.configure(
+                        text="⏳ Остановка...",
+                        text_color="#F59E0B"
+                    )
+                elif status == "START_PENDING":
+                    self.status_label.configure(
+                        text="⏳ Запуск...",
+                        text_color="#10B981"
+                    )
+                else:
+                    self.status_label.configure(
+                        text=f"● Статус: {status}",
+                        text_color="#9CA3AF"
+                    )
+                
+                if self.current_strategy:
+                    self.strategy_label.configure(text=f"Стратегия: {self.current_strategy}")
+                else:
+                    self.strategy_label.configure(text="Стратегия: не установлена")
+            else:
+                self.service_running = False
+                self.current_strategy = None
+                self.status_label.configure(
+                    text="○ Сервис НЕ установлен",
+                    text_color="#EF4444"
+                )
+                self.strategy_label.configure(text="Стратегия: --")
+            
+            # Обновляем состояние кнопок
+            self.btn_install.configure(state="normal" if not self.service_exists else "disabled")
+            self.btn_delete.configure(state="normal" if self.service_exists else "disabled")
+            self.btn_start.configure(state="normal" if (self.service_exists and not self.service_running) else "disabled")
+            self.btn_stop.configure(state="normal" if self.service_running else "disabled")
+            self.btn_restart.configure(state="normal" if self.service_running else "disabled")
+            
+            # Проверяем winws.exe
+            if ServiceManager.is_winws_running():
+                self.winws_status_label.configure(
+                    text="winws.exe: РАБОТАЕТ",
+                    text_color="#10B981"
+                )
+            else:
+                self.winws_status_label.configure(
+                    text="winws.exe: НЕ запущен",
+                    text_color="#9CA3AF"
+                )
+        except Exception as e:
+            self.status_label.configure(text=f"Ошибка: {str(e)}", text_color="#EF4444")
+
+    def update_status_periodically(self):
+        """Периодически обновляет статус."""
+        if self.winfo_exists():
+            self.refresh_status()
+            self.after(2000, self.update_status_periodically)
+
+    def install_service(self):
+        """Устанавливает сервис."""
+        version_path, _ = self.parent.get_current_paths()
+        bat_name = self.parent.selected_bat.get()
+        
+        if not version_path:
+            messagebox.showwarning("Внимание", "Выберите версию Zapret в главном окне.")
+            return
+        if not bat_name:
+            messagebox.showwarning("Внимание", "Выберите BAT-файл обхода в главном окне.")
+            return
+        
+        bat_path = os.path.join(version_path, bat_name)
+        bin_path = os.path.join(version_path, "bin", "winws.exe")
+        
+        if not os.path.isfile(bat_path):
+            messagebox.showerror("Ошибка", f"BAT файл не найден:\n{bat_path}")
+            return
+        if not os.path.isfile(bin_path):
+            messagebox.showerror("Ошибка", f"winws.exe не найден:\n{bin_path}")
+            return
+        
+        # Читаем аргументы из BAT файла
+        args = self.parse_bat_args(bat_path)
+        if not args:
+            messagebox.showerror("Ошибка", "Не удалось прочитать аргументы из BAT файла.")
+            return
+        
+        # Подтверждение
+        result = messagebox.askyesno(
+            "Подтверждение",
+            f"Установить сервис Zapret?\n\n"
+            f"Путь: {bin_path}\n"
+            f"Аргументы: {args[:100]}{'...' if len(args) > 100 else ''}\n\n"
+            f"Будет создан системный сервис 'zapret', который запускается автоматически."
+        )
+        if not result:
+            return
+        
+        # Выполняем установку
+        self.btn_install.configure(state="disabled", text="⏳ Установка...")
+        
+        def do_install():
+            success, message = ServiceManager.install_service(bin_path, args)
+            self.after(0, self._install_complete, success, message)
+        
+        threading.Thread(target=do_install, daemon=True).start()
+
+    def parse_bat_args(self, bat_path):
+        """Извлекает аргументы командной строки из BAT файла."""
+        try:
+            with open(bat_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            
+            # Ищем строку с winws.exe
+            for line in content.splitlines():
+                if "winws.exe" in line.lower():
+                    # Извлекаем всё после winws.exe
+                    idx = line.lower().find("winws.exe")
+                    if idx >= 0:
+                        args_part = line[idx + 9:].strip()
+                        # Удаляем комментарии и лишнее
+                        if "::" in args_part:
+                            args_part = args_part.split("::")[0].strip()
+                        if "rem " in args_part.lower():
+                            args_part = args_part.split("rem ")[0].strip()
+                        return args_part
+            return None
+        except Exception:
+            return None
+
+    def _install_complete(self, success, message):
+        """Обработка завершения установки."""
+        self.btn_install.configure(state="normal", text="📥 Установить сервис")
+        if success:
+            messagebox.showinfo("Успех", message)
+            self.refresh_status()
+        else:
+            messagebox.showerror("Ошибка", message)
+
+    def delete_service(self):
+        """Удаляет сервис."""
+        result = messagebox.askyesno(
+            "Подтверждение",
+            "Удалить сервис Zapret?\n\n"
+            "Это удалит сервис из системы.\n"
+            "winws.exe будет остановлен."
+        )
+        if not result:
+            return
+        
+        self.btn_delete.configure(state="disabled", text="⏳ Удаление...")
+        
+        def do_delete():
+            success, message = ServiceManager.delete_service()
+            self.after(0, self._delete_complete, success, message)
+        
+        threading.Thread(target=do_delete, daemon=True).start()
+
+    def _delete_complete(self, success, message):
+        """Обработка завершения удаления."""
+        self.btn_delete.configure(state="normal", text="🗑 Удалить сервис")
+        if success:
+            messagebox.showinfo("Успех", message)
+            self.refresh_status()
+        else:
+            messagebox.showerror("Ошибка", message)
+
+    def start_service(self):
+        """Запускает сервис."""
+        self.btn_start.configure(state="disabled", text="⏳ Запуск...")
+        
+        def do_start():
+            success, message = ServiceManager.start_service()
+            self.after(0, self._start_complete, success, message)
+        
+        threading.Thread(target=do_start, daemon=True).start()
+
+    def _start_complete(self, success, message):
+        """Обработка завершения запуска."""
+        self.btn_start.configure(state="normal", text="▶ Запустить")
+        if success:
+            self.refresh_status()
+        else:
+            messagebox.showerror("Ошибка", message)
+
+    def stop_service(self):
+        """Останавливает сервис."""
+        self.btn_stop.configure(state="disabled", text="⏳ Остановка...")
+        
+        def do_stop():
+            success, message = ServiceManager.stop_service()
+            self.after(0, self._stop_complete, success, message)
+        
+        threading.Thread(target=do_stop, daemon=True).start()
+
+    def _stop_complete(self, success, message):
+        """Обработка завершения остановки."""
+        self.btn_stop.configure(state="normal", text="⏹ Остановить")
+        if success:
+            self.refresh_status()
+        else:
+            messagebox.showerror("Ошибка", message)
+
+    def restart_service(self):
+        """Перезапускает сервис."""
+        self.btn_restart.configure(state="disabled", text="⏳ Перезапуск...")
+        
+        def do_restart():
+            success, message = ServiceManager.restart_service()
+            self.after(0, self._restart_complete, success, message)
+        
+        threading.Thread(target=do_restart, daemon=True).start()
+
+    def _restart_complete(self, success, message):
+        """Обработка завершения перезапуска."""
+        self.btn_restart.configure(state="normal", text="🔄 Перезапустить")
+        if success:
+            self.refresh_status()
+        else:
+            messagebox.showerror("Ошибка", message)
+
 
 # ============================================================
 # ЗАПУСК ОТ АДМИНИСТРАТОРА С ПРОВЕРКОЙ ЕДИНСТВЕННОГО ЭКЗЕМПЛЯРА
