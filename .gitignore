@@ -9,6 +9,8 @@ dist/
 *.so
 *.dll
 *.exe
+*.class
+*.a
 
 # Dependencies
 .venv/
@@ -16,40 +18,59 @@ venv/
 .env
 .env.local
 *.env.*
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-*.swo
-
-# Editors
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Coverage
+node_modules/
+.mypy_cache/
+.pytest_cache/
 .coverage
 coverage/
 htmlcov/
 
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
+
+# Gradle
+.gradle/
+target/
+
 # Python specific
-*.pyc
-__pycache__/
 *.pyo
 *.pyd
 .Python
-*.so
 *.egg-info/
-.eggs/
-
-# Build system
-.mypy_cache/
-.pytest_cache/
 .tox/
-.hypothesis/
-
-# OS generated
-.DS_Store
-Thumbs.db
+.nox/
