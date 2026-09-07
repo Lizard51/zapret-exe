@@ -288,7 +288,7 @@ class ZapretLauncher(ctk.CTk):
 
         # Окно
         self.title(APP_NAME)
-        self.geometry("620x740")
+        self.geometry("620x780")
         self.resizable(False, False)
         self.configure(fg_color="#121318")
 
@@ -451,7 +451,7 @@ class ZapretLauncher(ctk.CTk):
         self.right_col = ctk.CTkFrame(self.columns_frame, fg_color="transparent")
         self.right_col.pack(side="right", fill="both", expand=True, padx=(4, 0))
 
-        # Заголовок BAT с кнопкой теста всех
+        # Заголовок BAT с кнопкой теста всех и кнопкой проверки выбранного
         self.bat_header_frame = ctk.CTkFrame(self.right_col, fg_color="transparent")
         self.bat_header_frame.pack(fill="x", pady=(0, 4))
 
@@ -462,6 +462,20 @@ class ZapretLauncher(ctk.CTk):
             text_color="#9CA3AF"
         )
         self.profile_title.pack(side="left")
+
+        self.btn_check_single = ctk.CTkButton(
+            self.bat_header_frame,
+            text="✅ Проверить",
+            width=100,
+            height=22,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#10B981",
+            hover_color="#059669",
+            text_color="#FFFFFF",
+            corner_radius=6,
+            command=self.start_check_single
+        )
+        self.btn_check_single.pack(side="right", padx=(4, 0))
 
         self.btn_test_all = ctk.CTkButton(
             self.bat_header_frame,
@@ -856,16 +870,15 @@ class ZapretLauncher(ctk.CTk):
             wait_until_no_winws(timeout=PROCESS_STOP_TIMEOUT)
 
         # ========================================================
-        # 2. Запускаем BAT
+        # 2. Запускаем BAT (ВСЕГДА скрыто, как в массовом тесте)
         # ========================================================
 
         if progress_callback:
             progress_callback("⏳ Запуск...")
 
-        proc = self._launch_bat(
+        proc = self._launch_bat_for_test(
             bat_path,
-            version_path,
-            hidden=True
+            version_path
         )
 
         if proc is None:
@@ -1037,7 +1050,7 @@ class ZapretLauncher(ctk.CTk):
             if hidden:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = 0  # SW_HIDE
+                startupinfo.wShowWindow = SW_HIDE
 
             return subprocess.Popen(
                 ["cmd.exe", "/c", "call", bat_path],
@@ -1049,6 +1062,123 @@ class ZapretLauncher(ctk.CTk):
             )
         except Exception:
             return None
+
+    def run_bat_as_service(self, bat_path, cwd):
+        """Запускает BAT через service.bat install (как сервис в фоне)"""
+        # Ищем service.bat в той же папке
+        service_path = None
+        for filename in os.listdir(cwd):
+            if filename.lower().startswith("service") and filename.lower().endswith(".bat"):
+                service_path = os.path.join(cwd, filename)
+                break
+        
+        if not service_path:
+            return False
+        
+        try:
+            # Сначала uninstall старого сервиса (если есть)
+            subprocess.run(
+                ["cmd.exe", "/c", "call", service_path, "uninstall"],
+                cwd=cwd,
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True
+            )
+            
+            # Затем install нового
+            result = subprocess.run(
+                ["cmd.exe", "/c", "call", service_path, "install", bat_path],
+                cwd=cwd,
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True
+            )
+            
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    # ========================================================
+    # ПРОВЕРКА ОДНОГО BAT (кнопка "Проверить")
+    # ========================================================
+
+    def start_check_single(self):
+        """Запускает проверку выбранного BAT-файла с запуском winws.exe"""
+        if self.testing_all:
+            return
+        version = self.selected_version.get()
+        bat_name = self.selected_bat.get()
+        
+        if not version:
+            messagebox.showwarning("Внимание", "Сначала выберите версию.")
+            return
+        if not bat_name:
+            messagebox.showwarning("Внимание", "Выберите BAT-файл обхода.")
+            return
+        
+        bats = self.versions_data.get(version, [])
+        if bat_name not in bats:
+            messagebox.showwarning("Внимание", "Выбранный BAT-файл не найден.")
+            return
+        
+        # Сбрасываем события
+        self.test_cancel_event.clear()
+        self.shutdown_event.clear()
+        
+        # Блокируем кнопки
+        self.btn_check_single.configure(state="disabled", text="⏳ Проверка...")
+        self.btn_test_all.configure(state="disabled")
+        self.btn_start.configure(state="disabled")
+        self.btn_service.configure(state="disabled")
+        self.status_sub.configure(text=f"Проверка {bat_name}...")
+        
+        # Запускаем в потоке
+        threading.Thread(
+            target=self._check_single_worker,
+            args=(version, bat_name),
+            daemon=True
+        ).start()
+    
+    def _check_single_worker(self, version, bat_name):
+        """Worker для проверки одного BAT"""
+        version_path = os.path.join(self.root_dir, version)
+        
+        # Обновляем статус
+        self.after(0, self.update_bat_status, bat_name, "⏳ запуск...")
+        
+        # Вызываем единый метод тестирования
+        result = self.test_single_bat(
+            version_path,
+            bat_name,
+            progress_callback=lambda status, b=bat_name: self.after(0, self.update_bat_status, b, status)
+        )
+        
+        # Обновляем UI с результатом
+        self.after(0, self.update_bat_result, bat_name, result)
+        self.after(0, self._finish_check_single, bat_name, result)
+    
+    def _finish_check_single(self, bat_name, result):
+        """Завершение проверки одного BAT"""
+        if self.closing:
+            return
+        
+        self.btn_check_single.configure(state="normal", text="✅ Проверить")
+        self.btn_test_all.configure(state="normal")
+        self.btn_start.configure(state="normal")
+        self.btn_service.configure(state="normal")
+        
+        yt = result.get("youtube")
+        dc = result.get("discord")
+        
+        if yt is not None and dc is not None:
+            self.status_sub.configure(text=f"Проверка завершена. YouTube: {yt} ms, Discord: {dc} ms")
+        elif yt is not None or dc is not None:
+            self.status_sub.configure(text=f"Проверка завершена. Частичные данные.")
+        else:
+            self.status_sub.configure(text=f"Проверка завершена. Ошибка проверки.")
+        
+        # Обновляем список, чтобы отобразить результаты
+        self.update_bat_list()
+        self.refresh_tray()
 
     # ========================================================
     # МАССОВЫЙ ТЕСТ
@@ -1202,6 +1332,7 @@ class ZapretLauncher(ctk.CTk):
     # ========================================================
 
     def run_service_bat(self):
+        """Открывает меню с вариантами использования service.bat"""
         if self.testing_all:
             return
         version_path, service_path = self.get_current_paths()
@@ -1211,7 +1342,140 @@ class ZapretLauncher(ctk.CTk):
         if not service_path:
             messagebox.showerror("Ошибка", "Файл service.bat не найден в выбранной версии.")
             return
-
+        
+        # Создаем меню с опциями
+        menu = tk.Menu(
+            self,
+            tearoff=0,
+            bg="#1E2029",
+            fg="#FFFFFF",
+            activebackground="#10B981",
+            activeforeground="#FFFFFF"
+        )
+        
+        bat_name = self.selected_bat.get()
+        if bat_name:
+            bat_path = os.path.join(version_path, bat_name)
+            menu.add_command(
+                label=f"📦 Установить {bat_name} как сервис",
+                command=lambda: self.install_service(bat_path, version_path)
+            )
+            menu.add_command(
+                label=f"🗑️ Удалить сервис",
+                command=lambda: self.uninstall_service(service_path, version_path)
+            )
+            menu.add_separator()
+        
+        menu.add_command(
+            label="⚙ Открыть service.bat (консоль)",
+            command=lambda: self.open_service_console(service_path, version_path)
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="🔄 Обновить IPSet список",
+            command=lambda: self.run_service_command(service_path, version_path, "ipset_update")
+        )
+        menu.add_command(
+            label="📝 Обновить hosts файл",
+            command=lambda: self.run_service_command(service_path, version_path, "hosts_update")
+        )
+        menu.add_command(
+            label="🔍 Диагностика",
+            command=lambda: self.run_service_command(service_path, version_path, "diagnostics")
+        )
+        menu.add_command(
+            label="🧪 Тесты",
+            command=lambda: self.run_service_command(service_path, version_path, "tests")
+        )
+        
+        x = self.btn_service.winfo_rootx()
+        y = self.btn_service.winfo_rooty() + self.btn_service.winfo_height() + 4
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+    
+    def run_service_command(self, service_path, version_path, command):
+        """Запускает команду service.bat из приложения"""
+        try:
+            # Маппинг команд для service.bat
+            cmd_map = {
+                "ipset_update": "8",       # Обновить IPSet список
+                "hosts_update": "9",       # Обновить hosts файл
+                "diagnostics": "11",       # Диагностика
+                "tests": "12"              # Тесты
+            }
+            
+            cmd_arg = cmd_map.get(command, command)
+            
+            # Запускаем service.bat с нужной командой
+            subprocess.Popen(
+                ["cmd.exe", "/c", "call", service_path, cmd_arg],
+                cwd=version_path,
+                creationflags=0,  # Показываем окно для интерактивного режима
+            )
+        except Exception as error:
+            messagebox.showerror("Ошибка", f"Не удалось выполнить команду:\n{error}")
+    
+    def install_service(self, bat_path, version_path):
+        """Устанавливает BAT как сервис через service.bat install"""
+        service_path = None
+        for filename in os.listdir(version_path):
+            if filename.lower().startswith("service") and filename.lower().endswith(".bat"):
+                service_path = os.path.join(version_path, filename)
+                break
+        
+        if not service_path:
+            messagebox.showerror("Ошибка", "service.bat не найден")
+            return
+        
+        try:
+            # Сначала uninstall старого сервиса (если есть)
+            subprocess.run(
+                ["cmd.exe", "/c", "call", service_path, "uninstall"],
+                cwd=version_path,
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True
+            )
+            
+            # Затем install нового - передаем только имя файла, а не полный путь
+            # service.bat сам найдет файл в текущей директории
+            bat_name = os.path.basename(bat_path)
+            result = subprocess.run(
+                ["cmd.exe", "/c", "call", service_path, "install", bat_name],
+                cwd=version_path,
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                messagebox.showinfo("Успех", f"Сервис установлен:\n{bat_name}")
+            else:
+                messagebox.showerror("Ошибка", f"Не удалось установить сервис:\n{result.stderr}")
+        except Exception as error:
+            messagebox.showerror("Ошибка", f"Не удалось установить сервис:\n{error}")
+    
+    def uninstall_service(self, service_path, version_path):
+        """Удаляет сервис через service.bat uninstall"""
+        try:
+            result = subprocess.run(
+                ["cmd.exe", "/c", "call", service_path, "uninstall"],
+                cwd=version_path,
+                creationflags=HIDDEN_WINDOW_FLAG,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                messagebox.showinfo("Успех", "Сервис удален")
+            else:
+                messagebox.showerror("Ошибка", f"Не удалось удалить сервис:\n{result.stderr}")
+        except Exception as error:
+            messagebox.showerror("Ошибка", f"Не удалось удалить сервис:\n{error}")
+    
+    def open_service_console(self, service_path, version_path):
+        """Открывает service.bat в консоли (как раньше)"""
         try:
             ctypes.windll.shell32.ShellExecuteW(
                 None,
@@ -1379,6 +1643,30 @@ class ZapretLauncher(ctk.CTk):
         if not self.closing:
             self.after(0, self._update_ping_ui, yt_ms, dc_ms)
 
+    # ========================================================
+    # ЗАПУСК BAT (для массового теста - без GUI окна)
+    # ========================================================
+
+    def _launch_bat_for_test(self, bat_path, cwd):
+        """Запускает BAT-файл для тестирования, возвращает объект Popen или None при ошибке.
+        Всегда запускается скрыто, без открытия окна."""
+        try:
+            flags = HIDDEN_WINDOW_FLAG
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = SW_HIDE
+
+            return subprocess.Popen(
+                ["cmd.exe", "/c", "call", bat_path],
+                cwd=cwd,
+                creationflags=flags,
+                startupinfo=startupinfo,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            return None
+
     def _update_ping_ui(self, yt_ms, dc_ms):
         if self.closing:
             return
@@ -1530,7 +1818,17 @@ class ZapretLauncher(ctk.CTk):
             print(f"Ошибка обновления трея: {error}")
 
     def hide_to_tray(self):
-        self.withdraw()
+        # Сначала создаём трей, если он ещё не создан
+        if self.tray_icon is None:
+            self.setup_tray()
+            # Даем трею время на инициализацию
+            time.sleep(0.2)
+        # Проверяем, что трей активен
+        if self.tray_icon and self.tray_icon.visible:
+            self.withdraw()
+        else:
+            # Если трей не создался, всё равно скрываем окно
+            self.withdraw()
 
     def show_from_tray(self):
         self.deiconify()
