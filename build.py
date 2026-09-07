@@ -37,6 +37,9 @@ def run_pyinstaller():
     """Run PyInstaller to create the executable."""
     print("\nRunning PyInstaller...")
     
+    # Точка входа - __main__.py внутри пакета zapret_manager
+    entry_point = os.path.join(ZAPRET_MANAGER_DIR, "__main__.py")
+    
     # PyInstaller command with all necessary options
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -44,7 +47,7 @@ def run_pyinstaller():
         "--onedir",  # Creates a folder with exe and dependencies
         "--windowed",  # No console window (GUI app)
         "--icon=NONE",  # Add icon path here if you have one
-        "--add-data", f"{os.path.join(ZAPRET_MANAGER_DIR, '*.py')};zapret_manager/",
+        "--hidden-import", "zapret_manager",
         "--hidden-import", "tkinter",
         "--hidden-import", "tkinter.ttk",
         "--hidden-import", "tkinter.messagebox",
@@ -52,7 +55,9 @@ def run_pyinstaller():
         "--collect-all", "tkinter",
         "--noconfirm",
         "--clean",
-        os.path.join(ZAPRET_MANAGER_DIR, "__main__.py"),
+        "-p", PROJECT_ROOT,  # Добавляем корень проекта в путь поиска
+        "--paths", ZAPRET_MANAGER_DIR,  # Добавляем пакет в путь поиска
+        entry_point,  # Указываем точку входа как файл
     ]
     
     print(f"Command: {' '.join(cmd)}\n")
