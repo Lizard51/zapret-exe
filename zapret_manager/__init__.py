@@ -10,9 +10,11 @@ from .config import (
     LOCAL_VERSION,
 )
 from .gui import ZapretLauncher
+from .__main__ import main
 
 __all__ = [
     "APP_NAME",
     "LOCAL_VERSION",
     "ZapretLauncher",
+    "main",
 ]
