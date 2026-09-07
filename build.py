@@ -44,7 +44,7 @@ def run_pyinstaller():
         "--onedir",  # Creates a folder with exe and dependencies
         "--windowed",  # No console window (GUI app)
         "--icon=NONE",  # Add icon path here if you have one
-        "--add-data", f"{os.path.join(ZAPRET_MANAGER_DIR, '*.py')};zapret_manager/",
+        "--hidden-import", "zapret_manager",
         "--hidden-import", "tkinter",
         "--hidden-import", "tkinter.ttk",
         "--hidden-import", "tkinter.messagebox",
@@ -52,7 +52,8 @@ def run_pyinstaller():
         "--collect-all", "tkinter",
         "--noconfirm",
         "--clean",
-        os.path.join(ZAPRET_MANAGER_DIR, "__main__.py"),
+        "-p", PROJECT_ROOT,
+        "-m", "zapret_manager",
     ]
     
     print(f"Command: {' '.join(cmd)}\n")
