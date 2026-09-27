@@ -36,6 +36,16 @@ CONFIG_FILE = os.path.join(
 )
 
 HIDDEN_WINDOW_FLAG = 0x08000000  # CREATE_NO_WINDOW
+STARTF_USESHOWWINDOW = 0x00000001
+SW_HIDE = 0
+
+# Таймауты и параметры тестирования (вынесены в константы)
+WINWS_START_TIMEOUT = 5.0  # секунд на ожидание появления winws.exe
+WINWS_POLL_INTERVAL = 0.25  # интервал опроса PID
+PROCESS_STOP_TIMEOUT = 3.0  # секунд на ожидание завершения процесса
+PING_ATTEMPTS = 3  # количество попыток TCP-подключения
+PING_INTERVAL = 0.2  # интервал между попытками ping
+PING_TIMEOUT = 2.0  # таймаут одного подключения
 
 # Глобальная переменная для хранения хэндла мьютекса
 mutex_handle = None
@@ -84,8 +94,13 @@ def save_config(root_dir, run_bat_hidden):
     except Exception as error:
         print(f"Ошибка сохранения конфигурации: {error}")
 
-def check_tcp_ping(host, port=443, timeout=2.0, attempts=3):
+def check_tcp_ping(host, port=443, timeout=None, attempts=None):
     """Измеряет TCP-пинг до хоста, возвращает медиану в мс или None при ошибке."""
+    if timeout is None:
+        timeout = PING_TIMEOUT
+    if attempts is None:
+        attempts = PING_ATTEMPTS
+    
     results = []
     for _ in range(attempts):
         try:
@@ -95,7 +110,7 @@ def check_tcp_ping(host, port=443, timeout=2.0, attempts=3):
             results.append((time.perf_counter() - start) * 1000)
         except Exception:
             continue
-        time.sleep(0.2)
+        time.sleep(PING_INTERVAL)
     if not results:
         return None
     results.sort()
@@ -168,8 +183,10 @@ def kill_process_by_pid(pid):
     except Exception:
         return False
 
-def wait_for_process_exit(pid, timeout=3.0):
+def wait_for_process_exit(pid, timeout=None):
     """Ожидает завершения процесса с заданным PID, возвращает True если он исчез."""
+    if timeout is None:
+        timeout = PROCESS_STOP_TIMEOUT
     if pid is None:
         return True
     start = time.time()
@@ -187,16 +204,18 @@ def wait_for_process_exit(pid, timeout=3.0):
                 return True
         except Exception:
             pass
-        time.sleep(0.2)
+        time.sleep(WINWS_POLL_INTERVAL)
     return False
 
-def wait_until_no_winws(timeout=3.0):
+def wait_until_no_winws(timeout=None):
     """Ожидает, пока все winws.exe завершатся."""
+    if timeout is None:
+        timeout = PROCESS_STOP_TIMEOUT
     start = time.time()
     while time.time() - start < timeout:
         if not is_winws_running():
             return True
-        time.sleep(0.2)
+        time.sleep(WINWS_POLL_INTERVAL)
     return False
 
 # ============================================================
@@ -259,8 +278,13 @@ class ZapretLauncher(ctk.CTk):
         self.stopping = False
         self.closing = False
 
+        # Events для синхронизации потоков
+        self.shutdown_event = threading.Event()  # сигнал полного завершения приложения
+        self.test_cancel_event = threading.Event()  # сигнал отмены текущего теста
+
         # PID управляемого процесса (для обычного режима)
-        self.managed_pid = None
+        # Теперь хранит список PID, а не один PID
+        self.managed_pids = set()
 
         # Окно
         self.title(APP_NAME)
@@ -797,7 +821,7 @@ class ZapretLauncher(ctk.CTk):
 
         Схема:
             1. Фиксируем старые winws.exe
-            2. Удаляем старые winws.exe
+            2. Удаляем старые winws.exe (только если есть)
             3. Запускаем BAT
             4. Ждём появления НОВОГО winws.exe
             5. Проверяем YouTube
@@ -829,7 +853,7 @@ class ZapretLauncher(ctk.CTk):
 
         if old_pids:
             kill_winws()
-            wait_until_no_winws(timeout=3.0)
+            wait_until_no_winws(timeout=PROCESS_STOP_TIMEOUT)
 
         # ========================================================
         # 2. Запускаем BAT
@@ -861,12 +885,13 @@ class ZapretLauncher(ctk.CTk):
             progress_callback("⏳ Ожидание winws...")
 
         new_pids = set()
+        max_iterations = int(WINWS_START_TIMEOUT / WINWS_POLL_INTERVAL)
 
-        for _ in range(20):  # до 5 секунд (20 * 0.25)
-            if self.closing or self.stop_requested:
+        for _ in range(max_iterations):
+            if self.shutdown_event.is_set() or self.test_cancel_event.is_set():
                 break
 
-            time.sleep(0.25)
+            time.sleep(WINWS_POLL_INTERVAL)
 
             current_pids = set(get_winws_pids())
             new_pids = current_pids - old_pids
@@ -901,7 +926,7 @@ class ZapretLauncher(ctk.CTk):
         # 4. Проверка на остановку перед YouTube
         # ========================================================
 
-        if self.closing or self.stop_requested:
+        if self.shutdown_event.is_set() or self.test_cancel_event.is_set():
             # Останавливаем уже запущенные процессы
             for pid in new_pids:
                 kill_process_by_pid(pid)
@@ -921,14 +946,14 @@ class ZapretLauncher(ctk.CTk):
 
         yt_ms = check_tcp_ping(
             "www.youtube.com",
-            attempts=3
+            attempts=PING_ATTEMPTS
         )
 
         # ========================================================
         # 6. Проверка на остановку перед Discord
         # ========================================================
 
-        if self.closing or self.stop_requested:
+        if self.shutdown_event.is_set() or self.test_cancel_event.is_set():
             # Останавливаем процессы
             for pid in new_pids:
                 kill_process_by_pid(pid)
@@ -948,7 +973,7 @@ class ZapretLauncher(ctk.CTk):
 
         dc_ms = check_tcp_ping(
             "discord.com",
-            attempts=3
+            attempts=PING_ATTEMPTS
         )
 
         # ========================================================
@@ -966,11 +991,11 @@ class ZapretLauncher(ctk.CTk):
         # ========================================================
 
         start_wait = time.time()
-        while time.time() - start_wait < 3.0:
+        while time.time() - start_wait < PROCESS_STOP_TIMEOUT:
             remaining = set(get_winws_pids()) & new_pids
             if not remaining:
                 break
-            time.sleep(0.2)
+            time.sleep(WINWS_POLL_INTERVAL)
 
         # ========================================================
         # 10. Закрываем cmd.exe BAT, если он всё ещё работает
@@ -1041,6 +1066,10 @@ class ZapretLauncher(ctk.CTk):
             messagebox.showwarning("Внимание", "В выбранной версии нет BAT-файлов.")
             return
 
+        # Сбрасываем события перед новым тестом
+        self.test_cancel_event.clear()
+        self.shutdown_event.clear()
+        
         self.testing_all = True
         self.stop_requested = False
         self.btn_test_all.configure(state="disabled", text="⏳ Тестируем...")
@@ -1063,7 +1092,7 @@ class ZapretLauncher(ctk.CTk):
         version_path = os.path.join(self.root_dir, version)
 
         for idx, bat_name in enumerate(bats):
-            if self.closing or self.stop_requested:
+            if self.shutdown_event.is_set() or self.test_cancel_event.is_set():
                 break
 
             # Обновляем статус в UI
@@ -1073,7 +1102,7 @@ class ZapretLauncher(ctk.CTk):
             result = self.test_single_bat(
                 version_path,
                 bat_name,
-                progress_callback=lambda status: self.after(0, self.update_bat_status, bat_name, status)
+                progress_callback=lambda status, b=bat_name: self.after(0, self.update_bat_status, b, status)
             )
 
             # Обновляем UI с результатом (сохранение происходит внутри update_bat_result)
@@ -1112,6 +1141,10 @@ class ZapretLauncher(ctk.CTk):
             return
         self.testing_all = False
         self.stop_requested = False
+        # Очищаем события после завершения теста
+        self.test_cancel_event.clear()
+        self.shutdown_event.clear()
+        
         self.btn_test_all.configure(state="normal", text="📊 Тест всех")
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="normal")
@@ -1229,8 +1262,9 @@ class ZapretLauncher(ctk.CTk):
             old_pids = set(get_winws_pids())
 
             # Убиваем старые процессы и ждём их завершения
-            kill_winws()
-            wait_until_no_winws(timeout=3.0)
+            if old_pids:
+                kill_winws()
+                wait_until_no_winws(timeout=PROCESS_STOP_TIMEOUT)
 
             # Запускаем BAT с учётом настройки hidden
             proc = self._launch_bat(bat_path, version_path, hidden=self.run_bat_hidden)
@@ -1239,20 +1273,23 @@ class ZapretLauncher(ctk.CTk):
                 return
 
             # Ждём появления НОВОГО winws.exe
-            managed_pid = None
-            for _ in range(20):
-                time.sleep(0.25)
+            managed_pids = set()
+            max_iterations = int(WINWS_START_TIMEOUT / WINWS_POLL_INTERVAL)
+            
+            for _ in range(max_iterations):
+                time.sleep(WINWS_POLL_INTERVAL)
                 current_pids = set(get_winws_pids())
                 new_pids = current_pids - old_pids
                 if new_pids:
-                    managed_pid = next(iter(new_pids), None)
+                    managed_pids.update(new_pids)
                     break
 
-            if managed_pid is None:
+            if not managed_pids:
                 self.after(0, self._start_error, "winws.exe не появился")
                 return
 
-            self.managed_pid = managed_pid
+            # Сохраняем все найденные PID управляемых процессов
+            self.managed_pids = managed_pids
             if not self.closing:
                 self.after(0, self._finish_start, True)
 
@@ -1297,7 +1334,7 @@ class ZapretLauncher(ctk.CTk):
             return
         # Если идёт массовый тест, просто устанавливаем флаг остановки
         if self.testing_all:
-            self.stop_requested = True
+            self.test_cancel_event.set()
             self.btn_stop.configure(state="disabled", text="Остановка...")
             return
 
@@ -1307,8 +1344,14 @@ class ZapretLauncher(ctk.CTk):
         threading.Thread(target=self._stop_worker, daemon=True).start()
 
     def _stop_worker(self):
+        # Очищаем все управляемые процессы
+        for pid in self.managed_pids:
+            kill_process_by_pid(pid)
+        self.managed_pids.clear()
+        
+        # Дополнительно убиваем любые оставшиеся winws.exe на всякий случай
         kill_winws()
-        self.managed_pid = None
+        
         self.after(0, self._update_stop_ui)
 
     def _update_stop_ui(self):
@@ -1503,9 +1546,15 @@ class ZapretLauncher(ctk.CTk):
             return
         self.closing = True
 
+        # Сигнализируем о полном завершении приложения
+        self.shutdown_event.set()
+        
+        # Отменяем текущий тест, если он идёт
+        self.test_cancel_event.set()
+
         # Останавливаем все процессы
         kill_winws()
-        self.managed_pid = None
+        self.managed_pids.clear()
 
         # Останавливаем тестирование
         self.testing_all = False
@@ -1516,8 +1565,12 @@ class ZapretLauncher(ctk.CTk):
             if self.tray_icon:
                 self.tray_icon.visible = False
                 self.tray_icon.stop()
+                self.tray_icon = None
         except Exception:
             pass
+
+        # Небольшая задержка для корректного закрытия трея
+        time.sleep(0.1)
 
         # Закрываем окно
         try:
@@ -1562,6 +1615,7 @@ if __name__ == "__main__":
     if not os.path.isdir(app.root_dir):
         app.after(100, app.ask_for_folder)
 
-    app.mainloop()
-
-    release_mutex()
+    try:
+        app.mainloop()
+    finally:
+        release_mutex()
